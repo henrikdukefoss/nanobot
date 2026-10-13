@@ -115,16 +115,17 @@ class ContextBuilder:
             if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
                 parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
 
-        active_skills = self.skills.get_always_skills()
-        if active_skills:
-            active_content = self.skills.load_skills_for_context(active_skills)
-            if active_content:
-                parts.append(f"# Active Skills\n\n{active_content}")
+        with self.skills.snapshot():
+            active_skills = self.skills.get_always_skills()
+            if active_skills:
+                active_content = self.skills.load_skills_for_context(active_skills)
+                if active_content:
+                    parts.append(f"# Active Skills\n\n{active_content}")
 
-        skills_summary = self.skills.build_skills_summary(
-            exclude=set(active_skills),
-            workspace=root,
-        )
+            skills_summary = self.skills.build_skills_summary(
+                exclude=set(active_skills),
+                workspace=root,
+            )
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 

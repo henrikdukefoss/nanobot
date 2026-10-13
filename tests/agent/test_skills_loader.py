@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from nanobot.agent.context import ContextBuilder
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools.filesystem import ListDirTool, WriteFileTool
 from nanobot.agent.tools.search import GrepTool
@@ -463,6 +464,61 @@ def test_multiple_explicit_skills_share_one_ordered_runtime_context(tmp_path: Pa
         "### Skill: alpha"
     )
     assert "### Skill: always" not in context.content
+
+
+def test_plain_message_does_not_discover_skills(tmp_path: Path, monkeypatch) -> None:
+    loader = SkillsLoader(tmp_path)
+
+    def unexpected_discovery():
+        pytest.fail("ordinary chat must not scan skills for explicit references")
+
+    monkeypatch.setattr(loader, "_discover_skills", unexpected_discovery)
+    assert loader.build_explicit_skill_runtime_context("Explain this project") is None
+
+
+def test_prompt_reads_skills_once_and_refreshes_on_next_build(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+    skills = workspace / "skills"
+    alpha = _write_skill(skills, "alpha", metadata_json={"always": True}, body="First instructions")
+    beta = _write_skill(skills, "beta", metadata_json={"requires": {"bins": ["prompt-test-cli"]}})
+    builder = ContextBuilder(workspace)
+    builder.skills = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    reads: list[Path] = []
+    original_read = Path.read_text
+    command_available = False
+    checks: list[str] = []
+
+    def read(path, *args, **kwargs):
+        if path in {alpha, beta}:
+            reads.append(path)
+        return original_read(path, *args, **kwargs)
+
+    def which(command):
+        checks.append(command)
+        return "installed-command" if command_available else None
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr("nanobot.agent.skills.shutil.which", which)
+    first = builder.build_system_prompt()
+    assert "First instructions" in first
+    assert "unavailable: CLI: prompt-test-cli" in first
+    assert reads.count(alpha) == reads.count(beta) == 1
+    assert checks == ["prompt-test-cli"]
+
+    alpha.write_text(alpha.read_text().replace("First instructions", "Updated instructions"), encoding="utf-8")
+    command_available = True
+    _write_skill(skills, "gamma", body="New skill")
+    reads.clear()
+    checks.clear()
+    second = builder.build_system_prompt()
+    assert "Updated instructions" in second and "First instructions" not in second
+    assert "unavailable: CLI: prompt-test-cli" not in second
+    assert "**gamma**" in second
+    assert reads.count(alpha) == reads.count(beta) == 1
+    assert checks == ["prompt-test-cli"]
 
 
 # -- multiline description tests (YAML folded > and literal |) -----------------

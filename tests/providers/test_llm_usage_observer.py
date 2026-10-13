@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
 
-from nanobot.llm_usage.context import llm_usage_source
+from nanobot.llm_usage.context import current_llm_usage_source, llm_usage_source
 from nanobot.llm_usage.models import LLMCallRecord
 from nanobot.providers.base import LLMProvider, LLMResponse, LLMUsage
 from nanobot.providers.fallback_provider import FallbackProvider
@@ -117,6 +118,72 @@ async def test_observer_estimates_missing_success_usage_without_storing_content(
     assert response.usage.source == "estimated"
     assert events[0].usage == response.usage
     assert "content" not in LLMCallRecord.__dataclass_fields__
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_missing_usage_preparation_preserves_observer_and_cancellation(
+    monkeypatch, stream: bool, cancel: bool,
+) -> None:
+    provider = _NoRetryProvider(iter([LLMResponse(content="hello")]))
+    runtime_loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    events: list[LLMCallRecord] = []
+    observer_loops = []
+    sources = []
+    requests = []
+    original_usage = provider._usage_for_call
+    original_chat = provider.chat
+
+    async def chat(**kwargs):
+        requests.append(kwargs)
+        return await original_chat(**kwargs)
+
+    def estimate(response, kwargs):
+        sources.append(current_llm_usage_source())
+        runtime_loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "test did not release usage estimation"
+        return original_usage(response, kwargs)
+
+    def observe(event):
+        observer_loops.append(asyncio.get_running_loop())
+        events.append(event)
+
+    monkeypatch.setattr(provider, "chat", chat)
+    monkeypatch.setattr(provider, "_usage_for_call", estimate)
+    provider.set_llm_call_observer(observe)
+    call = provider.chat_stream_with_retry if stream else provider.chat_with_retry
+    with llm_usage_source("api"):
+        task = asyncio.create_task(call(messages=[{"role": "user", "content": "hello"}]))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert sources == ["api"]
+        assert len(requests) == 1
+        assert not events
+        if cancel:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+        else:
+            response = await asyncio.wait_for(task, timeout=5)
+            assert response.content == "hello"
+        assert len(events) == 1
+        assert events[0].source == "api"
+        assert events[0].finish_reason == "stop"
+        assert events[0].usage is not None and events[0].usage.source == "estimated"
+        assert observer_loops == [runtime_loop]
+        assert len(requests) == 1
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
